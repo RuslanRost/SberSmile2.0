@@ -1,0 +1,17 @@
+{
+  "video_size": [336, 672],
+  "camera_index": 0,
+  "smile_hold_seconds": 0.5,
+  "idle_delay_seconds": 5.0,
+  "trigger_cooldown_seconds": 5.0,
+  "smile_score_threshold": 0.35,
+  "smile_smooth_alpha": 0.1,
+  "smile_smooth_window": 5,
+  "trigger_sync_frames": [0, 150, 283, 452, 537, 637, 712, 845],
+  "camera_view_scale": 0.5,
+  "min_face_area_ratio": 0.02,
+  "face_detection_confidence": 0.5,
+  "face_tracking_confidence": 0.5,
+  "face_area_reference": 0.05,
+  "face_landmarker_model": "models/face_landmarker.task"
+}
