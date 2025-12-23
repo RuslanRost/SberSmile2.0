@@ -1,17 +1,27 @@
+// Размер окна для отображаемого ролика (h, w)
 {
   "video_size": [336, 672],
+  // Какую камеру открыть (0 — первая)
   "camera_index": 0,
-  "smile_hold_seconds": 0.5,
+  // Пауза после активного видео перед возвратом к idle (сек)
   "idle_delay_seconds": 5.0,
-  "trigger_cooldown_seconds": 5.0,
-  "smile_score_threshold": 0.35,
+  // Кулдаун перед повторным запуском активного видео (сек)
+  "trigger_cooldown_seconds": 3.0,
+  // Сглаживание метрик (0..1), меньше — плавнее
   "smile_smooth_alpha": 0.1,
-  "smile_smooth_window": 5,
+  // Порог падения суммы процентов (доля от baseline) для срабатывания улыбки
+  "smile_drop_factor": 0.85,
+  // Кадры, на которых активное видео может стартовать (синхронизация)
   "trigger_sync_frames": [0, 150, 283, 452, 537, 637, 712, 845],
+  // Масштаб встраиваемого превью камеры
   "camera_view_scale": 0.5,
+  // Минимальная доля площади лица в кадре для учёта улыбки
   "min_face_area_ratio": 0.02,
+  // Пороги детекции/трекинга лица mediapipe
   "face_detection_confidence": 0.5,
   "face_tracking_confidence": 0.5,
-  "face_area_reference": 0.05,
-  "face_landmarker_model": "models/face_landmarker.task"
+  // Путь к модели landmarker
+  "face_landmarker_model": "models/face_landmarker.task",
+  // Во сколько раз сумма процентов должна превысить baseline, чтобы пересчитать baseline
+  "baseline_recalc_factor": 1.15
 }
