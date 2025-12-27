@@ -59,8 +59,12 @@ if errorlevel 1 (
 git pull origin main
 
 :run
-call ".venv312\Scripts\Activate.bat"
-python main.py
+if exist ".venv312\Scripts\python.exe" (
+  ".venv312\Scripts\python.exe" main.py
+) else (
+  echo Venv not found. Running system Python.
+  python main.py
+)
 if errorlevel 1 (
   echo Script exited with error.
   pause
