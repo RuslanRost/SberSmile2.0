@@ -43,9 +43,42 @@ DEFAULT_CONFIG = {
 
 
 def _json_load_with_comments(text: str):
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    text = re.sub(r"//.*", "", text)
-    return json.loads(text)
+    result = []
+    i = 0
+    in_string = False
+    escape = False
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < len(text) and text[i] not in "\r\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < len(text) and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        result.append(ch)
+        i += 1
+    return json.loads("".join(result))
 
 
 def load_config(path: Path):
@@ -400,6 +433,8 @@ def main():
     cam = cv2.VideoCapture(cam_source)
     if not cam.isOpened():
         raise RuntimeError("Cannot open camera")
+    print(f"Camera source: {cam_source}")
+    print(f"Camera opened: {cam.isOpened()}")
     setup_camera_props(cam)
 
     idle_path = find_idle_video()
@@ -610,6 +645,7 @@ def main():
 
             # Debug overlay text
             debug_lines = []
+            debug_lines.append(f"source: {cam_source}")
             debug_lines.append(f"idle_frame: {last_idle_idx}")
             debug_lines.append(f"next_sync: {next_sync_frame(last_idle_idx)}")
             # mode = "trigger" if playing_trigger else "idle"

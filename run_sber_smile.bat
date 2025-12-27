@@ -4,10 +4,11 @@ cd /d "%~dp0"
 
 powershell -NoProfile -Command "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass" >nul 2>nul
 
+set WINGET_OK=1
 where winget >nul 2>nul
 if errorlevel 1 (
+  set WINGET_OK=0
   echo Winget not found. Skipping auto-install.
-  goto check_tools
 )
 
 where git >nul 2>nul
@@ -19,11 +20,19 @@ if errorlevel 1 call :install_python
 :check_tools
 where git >nul 2>nul
 if errorlevel 1 (
+  if "%WINGET_OK%"=="0" (
+    echo Git not found and winget is unavailable. Install Git manually.
+    pause
+  )
   echo Git not found. Continuing without update.
   goto run
 )
 py -3.12 -V >nul 2>nul
 if errorlevel 1 (
+  if "%WINGET_OK%"=="0" (
+    echo Python 3.12 not found and winget is unavailable. Install Python manually.
+    pause
+  )
   echo Python 3.12 not found. Continuing without update.
   goto run
 )
