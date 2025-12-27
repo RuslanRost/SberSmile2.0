@@ -2,6 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
+powershell -NoProfile -Command "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass" >nul 2>nul
+
 where winget >nul 2>nul
 if errorlevel 1 (
   echo Winget not found. Skipping auto-install.
@@ -60,14 +62,21 @@ git pull origin main
 
 :run
 if not exist ".venv312\Scripts\python.exe" (
-  echo Venv not found. Please create .venv312.
+  call :create_venv
+) else (
+  ".venv312\Scripts\python.exe" -V >nul 2>nul
+  if errorlevel 1 call :recreate_venv
+)
+
+if not exist ".venv312\Scripts\python.exe" (
+  echo Venv creation failed.
   pause
   goto :eof
 )
 
-".venv312\Scripts\python.exe" -V >nul 2>nul
+call :install_deps
 if errorlevel 1 (
-  echo Venv Python is broken. Recreate .venv312.
+  echo Dependency installation failed.
   pause
   goto :eof
 )
@@ -94,4 +103,19 @@ if errorlevel 1 (
   echo Python install failed.
   pause
 )
+goto :eof
+
+:create_venv
+py -3.12 -m venv .venv312
+goto :eof
+
+:recreate_venv
+echo Recreating venv...
+if exist ".venv312" rmdir /s /q ".venv312"
+py -3.12 -m venv .venv312
+goto :eof
+
+:install_deps
+".venv312\Scripts\python.exe" -m pip install --upgrade pip >nul 2>nul
+".venv312\Scripts\python.exe" -m pip install opencv-python mediapipe numpy
 goto :eof
