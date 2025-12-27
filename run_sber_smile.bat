@@ -26,6 +26,14 @@ if errorlevel 1 (
   goto run
 )
 
+if not exist ".git" (
+  echo No .git found. Initializing from remote...
+  git init
+  git remote add origin https://github.com/RuslanRost/SberSmile2.0
+  git fetch origin main
+  git reset --hard origin/main
+)
+
 git fetch origin main
 if errorlevel 1 (
   echo Git fetch failed. Continuing without update.
