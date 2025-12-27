@@ -126,5 +126,5 @@ goto :eof
 
 :install_deps
 ".venv312\Scripts\python.exe" -m pip install --upgrade pip >nul 2>nul
-".venv312\Scripts\python.exe" -m pip install opencv-python mediapipe numpy tensorflow
+".venv312\Scripts\python.exe" -m pip install opencv-python mediapipe numpy tensorflow optree
 goto :eof
