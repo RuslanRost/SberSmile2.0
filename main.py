@@ -187,6 +187,21 @@ def overlay_frame(base: np.ndarray, overlay: np.ndarray) -> np.ndarray:
     x2, y2 = min(w, x1 + ow), min(h, oh)
     resized = cv2.resize(overlay, (x2 - x1, y2 - y1))
     result = base.copy()
+    # draw border outside the overlay area (2px), without covering content
+    border = 2
+    top = max(0, y1 - border)
+    bottom = min(h, y2 + border)
+    left = max(0, x1 - border)
+    right = min(w, x2 + border)
+    color = (0, 0, 255)
+    if top < y1:
+        result[top:y1, left:right] = color
+    if y2 < bottom:
+        result[y2:bottom, left:right] = color
+    if left < x1:
+        result[top:bottom, left:x1] = color
+    if x2 < right:
+        result[top:bottom, x2:right] = color
     result[y1:y2, x1:x2] = resized
     return result
 
