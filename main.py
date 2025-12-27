@@ -1,44 +1,35 @@
-import random
 import time
 from pathlib import Path
 import json
-import math
 import re
+
 import cv2
 import numpy as np
 import ctypes
-import mediapipe as mp
-from mediapipe.tasks.python.vision import face_landmarker as mp_face_landmarker
-from mediapipe.tasks.python.core.base_options import BaseOptions
-from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
-    VisionTaskRunningMode,
-)
-from mediapipe.tasks.python.core import mediapipe_c_bindings as mp_cb
+import threading
 
-# Settings
-WINDOW_NAME = "SberSmile"
+try:
+    from tensorflow.keras.preprocessing.image import img_to_array
+    from tensorflow.keras.models import load_model
+except Exception:
+    from keras.preprocessing.image import img_to_array
+    from keras.models import load_model
 
-IDLE_DIR = Path("idle")
-TRIGGER_DIR = Path("active")
-VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+
 DEFAULT_CONFIG = {
-    "video_size": [336, 672],
     "camera_index": 0,
     "camera_url": "",
-    "idle_delay_seconds": 5.0,
-    "trigger_cooldown_seconds": 5.0,
-    "smile_smooth_alpha": 0.1,
-    "smile_drop_factor": 0.85,
-    "trigger_sync_frames": [0, 150, 283, 452, 537, 637, 712, 845],
+    "camera_capture_resolution": [1280, 720],
     "camera_view_scale": 0.5,
-    "camera_capture_resolution": [1920, 1080],
-    "camera_autofocus": True,
-    "camera_auto_exposure": True,
-    "min_face_area_ratio": 0.02,
-    "face_detection_confidence": 0.5,
-    "face_tracking_confidence": 0.5,
-    "face_landmarker_model": "models/face_landmarker.task",
-    "baseline_recalc_factor": 1.15,
+    "camera_display_scale": 1.0,
+    "video_size": [336, 672],
+    "cnn_detect_scale": 0.5,
+    "cnn_every_n": 2,
+    "smile_hold_seconds": 0.5,
+    "idle_smile_delay": 2.0,
+    "trigger_sync_frames": [0, 150, 283, 395, 480, 649, 741, 817, 892, 1025, 1138, 1238],
+    "smile_cnn_model": "model.h5",
+    "smile_cascade_path": "haarcascade_frontalface_default.xml",
 }
 
 
@@ -90,58 +81,34 @@ def load_config(path: Path):
             cfg.update({k: v for k, v in data.items() if k in cfg})
         except Exception as exc:
             print(f"Failed to read config {path}, using defaults. Error: {exc}")
-    cfg["video_size"] = tuple(int(x) for x in cfg["video_size"])
-    cfg["trigger_sync_frames"] = [int(x) for x in cfg["trigger_sync_frames"]]
     cfg["camera_index"] = int(cfg["camera_index"])
     cfg["camera_url"] = str(cfg.get("camera_url", "") or "")
-    cfg["idle_delay_seconds"] = float(cfg["idle_delay_seconds"])
-    cfg["trigger_cooldown_seconds"] = float(cfg["trigger_cooldown_seconds"])
-    cfg["smile_smooth_alpha"] = float(cfg["smile_smooth_alpha"])
-    cfg["camera_view_scale"] = float(cfg["camera_view_scale"])
     cfg["camera_capture_resolution"] = tuple(int(x) for x in cfg["camera_capture_resolution"])
-    cfg["camera_autofocus"] = bool(cfg["camera_autofocus"])
-    cfg["camera_auto_exposure"] = bool(cfg["camera_auto_exposure"])
-    cfg["min_face_area_ratio"] = float(cfg["min_face_area_ratio"])
-    cfg["face_detection_confidence"] = float(cfg["face_detection_confidence"])
-    cfg["face_tracking_confidence"] = float(cfg["face_tracking_confidence"])
-    cfg["face_landmarker_model"] = str(cfg["face_landmarker_model"])
-    cfg["smile_drop_factor"] = float(cfg["smile_drop_factor"])
-    cfg["baseline_recalc_factor"] = float(cfg["baseline_recalc_factor"])
+    cfg["camera_view_scale"] = float(cfg["camera_view_scale"])
+    cfg["camera_display_scale"] = float(cfg["camera_display_scale"])
+    cfg["video_size"] = tuple(int(x) for x in cfg["video_size"])
+    cfg["cnn_detect_scale"] = float(cfg["cnn_detect_scale"])
+    cfg["cnn_every_n"] = int(cfg["cnn_every_n"])
+    cfg["smile_hold_seconds"] = float(cfg["smile_hold_seconds"])
+    cfg["idle_smile_delay"] = float(cfg["idle_smile_delay"])
+    cfg["trigger_sync_frames"] = [int(x) for x in cfg["trigger_sync_frames"]]
+    cfg["smile_cnn_model"] = str(cfg["smile_cnn_model"])
+    cfg["smile_cascade_path"] = str(cfg["smile_cascade_path"])
     return cfg
 
 
-def patch_mediapipe_bindings():
-    """Work around mediapipe Windows dll missing free() export."""
-    def _patched_load_raw_library(signatures=()):
-        from importlib import resources
+def setup_camera_props(cam, cfg):
+    try:
+        w, h = cfg["camera_capture_resolution"]
+        cam.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    except Exception:
+        pass
 
-        global _shared_lib  # not used, but keeps signature similar
-        if mp_cb._shared_lib is None:
-            lib_filename = "libmediapipe.dll"
-            lib_path_context = resources.files("mediapipe.tasks.c")
-            absolute_lib_path = str(lib_path_context / lib_filename)
-            mp_cb._shared_lib = ctypes.CDLL(absolute_lib_path)
 
-        for signature in signatures:
-            c_func = getattr(mp_cb._shared_lib, signature.func_name)
-            c_func.argtypes = signature.argtypes
-            c_func.restype = signature.restype
-
-        # Attach free; fallback to msvcrt.free if not exported.
-        try:
-            free_func = mp_cb._shared_lib.free
-            free_func.argtypes = [ctypes.c_void_p]
-            free_func.restype = None
-        except AttributeError:
-            mp_cb._shared_lib.free = ctypes.cdll.msvcrt.free
-        return mp_cb._shared_lib
-
-    def _patched_load_shared_library(signatures=()):
-        raw_lib = _patched_load_raw_library(signatures)
-        return mp_cb.serial_dispatcher.SerialDispatcher(raw_lib, signatures)
-
-    mp_cb.load_raw_library = _patched_load_raw_library
-    mp_cb.load_shared_library = _patched_load_shared_library
+def get_screen_size():
+    user32 = ctypes.windll.user32
+    return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
 
 
 class VideoLooper:
@@ -149,6 +116,8 @@ class VideoLooper:
         self.path = path
         self.cap = None
         self.frame_idx = -1
+        self.fps = 30.0
+        self.loop_started_at = time.monotonic()
         self._open()
 
     def _open(self):
@@ -156,22 +125,33 @@ class VideoLooper:
             self.cap.release()
         self.cap = cv2.VideoCapture(str(self.path))
         self.frame_idx = -1
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.fps = fps if fps and fps > 0 else 30.0
+        self.loop_started_at = time.monotonic()
 
     def frame(self):
         if not self.cap or not self.cap.isOpened():
             self._open()
         looped = False
+        now = time.monotonic()
+        expected_idx = int((now - self.loop_started_at) * self.fps)
+        if self.frame_idx < 0:
+            expected_idx = max(expected_idx, 0)
+        max_skip = 60
+        while self.frame_idx < expected_idx and max_skip > 0:
+            ret, frame = self.cap.read()
+            if not ret:
+                self._open()
+                looped = True
+                return None, -1, looped
+            self.frame_idx = 0 if self.frame_idx < 0 else self.frame_idx + 1
+            max_skip -= 1
         ret, frame = self.cap.read()
         if not ret:
             self._open()
             looped = True
-            ret, frame = self.cap.read()
-        if not ret:
             return None, -1, looped
-        if self.frame_idx < 0:
-            self.frame_idx = 0
-        else:
-            self.frame_idx += 1
+        self.frame_idx = 0 if self.frame_idx < 0 else self.frame_idx + 1
         return frame, self.frame_idx, looped
 
     def release(self):
@@ -179,168 +159,21 @@ class VideoLooper:
             self.cap.release()
 
 
-def overlay_frame(base: np.ndarray, overlay: np.ndarray) -> np.ndarray:
-    """Place overlay frame at top-right of base frame."""
-    h, w = base.shape[:2]
-    ow, oh = CONFIG["video_size"]
-    x1, y1 = max(w - ow, 0), 0
-    x2, y2 = min(w, x1 + ow), min(h, oh)
-    resized = cv2.resize(overlay, (x2 - x1, y2 - y1))
-    result = base.copy()
-    # draw border outside the overlay area (2px), without covering content
-    border = 2
-    top = max(0, y1 - border)
-    bottom = min(h, y2 + border)
-    left = max(0, x1 - border)
-    right = min(w, x2 + border)
-    color = (0, 0, 255)
-    if top < y1:
-        result[top:y1, left:right] = color
-    if y2 < bottom:
-        result[y2:bottom, left:right] = color
-    if left < x1:
-        result[top:bottom, left:x1] = color
-    if x2 < right:
-        result[top:bottom, x2:right] = color
-    result[y1:y2, x1:x2] = resized
-    return result
+def find_idle_video() -> Path:
+    idle_dir = Path("idle")
+    if not idle_dir.exists():
+        raise RuntimeError(f"Idle folder not found: {idle_dir}")
+    for candidate in sorted(idle_dir.iterdir()):
+        if candidate.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
+            return candidate
+    raise RuntimeError(f"No idle video found in {idle_dir}")
 
 
-def place_camera_view(base: np.ndarray, cam_frame: np.ndarray) -> np.ndarray:
-    """Place camera view on the canvas, scaled to a fraction of height."""
-    if cam_frame is None:
-        return base
-    h, w = base.shape[:2]
-    ch, cw = cam_frame.shape[:2]
-    target_h = max(1, int(h * CONFIG["camera_view_scale"]))
-    target_w = max(1, int(cw * (target_h / ch)))
-    if target_w > w:
-        target_w = w
-        target_h = int(ch * (target_w / cw))
-    resized = cv2.resize(cam_frame, (target_w, target_h))
-    margin = 20
-    x1 = margin
-    y1 = h - target_h - margin
-    x2 = min(w, x1 + target_w)
-    y2 = min(h, y1 + target_h)
-    base[y1:y2, x1:x2] = resized[: y2 - y1, : x2 - x1]
-    return base
-
-
-FACE_MOUTH_LANDMARKS = {
-    "left": 61,
-    "right": 291,
-    "top": 13,
-    "bottom": 14,
-}
-# Landmark sets for eye horizontal bounds (MediaPipe FaceMesh indices)
-EYE_LANDMARKS_LEFT = [33, 7, 163, 144, 145, 153, 154, 155, 133]
-EYE_LANDMARKS_RIGHT = [263, 249, 390, 373, 374, 380, 381, 382, 362]
-
-
-def capture_photo(frame_bgr: np.ndarray, label: str, folder: Path, ts: str | None = None) -> Path | None:
-    """Save BGR frame to disk with label; returns saved path or None."""
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        ts = ts or time.strftime("%Y%m%d_%H%M%S")
-        filename = f"{ts}-{label}.jpg"
-        path = folder / filename
-        cv2.imwrite(str(path), frame_bgr)
-        return path
-    except Exception as exc:
-        print(f"Failed to save photo {label}: {exc}")
-        return None
-
-
-def detect_smile(frame_bgr, face_mesh):
-    """Detect face and mouth metrics using MediaPipe Face Landmarker."""
-    h, w = frame_bgr.shape[:2]
-    yaw_rad = None
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_bgr)
-    results = face_mesh.detect(mp_image)
-    if not results.face_landmarks:
-        return False, 0.0, 0.0, [], [], None, yaw_rad, {}
-
-    if getattr(results, "facial_transformation_matrixes", None):
-        m = results.facial_transformation_matrixes[0]
-        # Rotation matrix entries
-        r00, r01, r02 = m[0][0], m[0][1], m[0][2]
-        r10, r11, r12 = m[1][0], m[1][1], m[1][2]
-        r20, r21, r22 = m[2][0], m[2][1], m[2][2]
-        # Yaw extraction from rotation matrix (camera coords)
-        yaw_rad = math.atan2(-r20, math.sqrt(r00 * r00 + r10 * r10))
-
-    landmarks = results.face_landmarks[0]
-    xs = [int(lm.x * w) for lm in landmarks]
-    ys = [int(lm.y * h) for lm in landmarks]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    face_box = (min_x, min_y, max_x - min_x, max_y - min_y)
-
-    face_area_ratio = 0.0
-    if w * h > 0:
-        face_area_ratio = max(0.0, (face_box[2] * face_box[3]) / float(w * h))
-
-    mouth_pts = {}
-    for key, idx in FACE_MOUTH_LANDMARKS.items():
-        lm = landmarks[idx]
-        mouth_pts[key] = (int(lm.x * w), int(lm.y * h))
-
-    left = mouth_pts["left"]
-    right = mouth_pts["right"]
-    top = mouth_pts["top"]
-    bottom = mouth_pts["bottom"]
-
-    mouth_width = max(1.0, abs(right[0] - left[0]))
-    mouth_height = max(1.0, abs(bottom[1] - top[1]))
-    lift_left = bottom[1] - left[1]
-    lift_right = bottom[1] - right[1]
-    avg_lift = (lift_left + lift_right) / 2.0
-    lift_norm = max(0.0, avg_lift / mouth_height)
-    width_height_ratio = mouth_width / mouth_height
-    smile_raw = min(1.0, lift_norm * 1.5 * width_height_ratio / 2.0)
-
-    smile_boxes = []
-    mouth_metrics = {
-        "left": left,
-        "right": right,
-        "top": top,
-        "bottom": bottom,
-        "delta_left": lift_left,
-        "delta_right": lift_right,
-        "delta_left_norm": lift_left / mouth_height,
-        "delta_right_norm": lift_right / mouth_height,
-        "width_height_ratio": width_height_ratio,
-        "lift_norm": lift_norm,
-        "center": (
-            int((left[0] + right[0]) / 2),
-            int((top[1] + bottom[1]) / 2),
-        ),
-    }
-
-    def _eye_span(indices):
-        pts = [(int(landmarks[idx].x * w), int(landmarks[idx].y * h)) for idx in indices if idx < len(landmarks)]
-        if not pts:
-            return None, None, None, None
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        min_x = min(xs)
-        max_x = max(xs)
-        center_y = int(sum(ys) / len(ys))
-        corner_left = min(pts, key=lambda p: p[0])
-        corner_right = max(pts, key=lambda p: p[0])
-        return min_x, max_x, corner_left, corner_right
-
-    left_min, _left_max, left_corner_pt, _ = _eye_span(EYE_LANDMARKS_LEFT)
-    _right_min, right_max, _, right_corner_pt = _eye_span(EYE_LANDMARKS_RIGHT)
-    eye_bounds = {
-        "left_min": left_min,
-        "right_max": right_max,
-        "left_corner": left_corner_pt,
-        "right_corner": right_corner_pt,
-    }
-
-    return True, smile_raw, face_area_ratio, [face_box], smile_boxes, mouth_metrics, yaw_rad, eye_bounds
+def list_active_videos():
+    active_dir = Path("active")
+    if not active_dir.exists():
+        return []
+    return [p for p in sorted(active_dir.iterdir()) if p.suffix.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm")]
 
 
 def play_video_once(path: Path):
@@ -353,481 +186,222 @@ def play_video_once(path: Path):
     cap.release()
 
 
-def find_idle_video() -> Path:
-    if not IDLE_DIR.exists():
-        raise RuntimeError(f"Idle folder not found: {IDLE_DIR}")
-    for candidate in sorted(IDLE_DIR.iterdir()):
-        if candidate.suffix.lower() in VIDEO_EXTS:
-            return candidate
-    raise RuntimeError(f"No idle video found in {IDLE_DIR}")
-
-
-def list_trigger_videos():
-    if not TRIGGER_DIR.exists():
-        return []
-    return [
-        p for p in sorted(TRIGGER_DIR.iterdir()) if p.suffix.lower() in VIDEO_EXTS
-    ]
-
-
-def get_screen_size():
-    user32 = ctypes.windll.user32
-    return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
-
-
-def setup_camera_props(cam):
-    """Attempt to set camera properties for focus/exposure/resolution."""
-    try:
-        w, h = CONFIG["camera_capture_resolution"]
-        cam.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-    except Exception:
-        pass
-    try:
-        cam.set(cv2.CAP_PROP_AUTOFOCUS, 1 if CONFIG["camera_autofocus"] else 0)
-    except Exception:
-        pass
-    try:
-        if CONFIG["camera_auto_exposure"]:
-            # 0.75 works for many DirectShow drivers as "auto"
-            cam.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-        else:
-            cam.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    except Exception:
-        pass
-    try:
-        cam.set(cv2.CAP_PROP_BRIGHTNESS, 0.5)
-    except Exception:
-        pass
-
-
-def hide_cursor():
-    try:
-        ctypes.windll.user32.ShowCursor(False)
-    except Exception:
-        pass
-
-
-def show_cursor():
-    try:
-        ctypes.windll.user32.ShowCursor(True)
-    except Exception:
-        pass
-
-
-def next_sync_frame(current_idx: int):
-    for f in CONFIG["trigger_sync_frames"]:
+def next_sync_frame(current_idx: int, frames: list[int]):
+    for f in frames:
         if f >= current_idx:
             return f
-    return CONFIG["trigger_sync_frames"][0]
+    return frames[0] if frames else 0
+
+
+def overlay_top_right(base: np.ndarray, overlay: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    h, w = base.shape[:2]
+    ow, oh = size
+    x1, y1 = max(w - ow, 0), 0
+    x2, y2 = min(w, x1 + ow), min(h, oh)
+    resized = cv2.resize(overlay, (x2 - x1, y2 - y1))
+    # draw border outside the overlay area (2px), without covering content
+    border = 2
+    top = max(0, y1 - border)
+    bottom = min(h, y2 + border)
+    left = max(0, x1 - border)
+    right = min(w, x2 + border)
+    color = (0, 0, 255)
+    if top < y1:
+        base[top:y1, left:right] = color
+    if y2 < bottom:
+        base[y2:bottom, left:right] = color
+    if left < x1:
+        base[top:bottom, left:x1] = color
+    if x2 < right:
+        base[top:bottom, x2:right] = color
+    base[y1:y2, x1:x2] = resized
+    return base
+
+
+def place_camera_bottom_left(base: np.ndarray, cam_frame: np.ndarray, scale: float) -> np.ndarray:
+    if cam_frame is None:
+        return base
+    h, w = base.shape[:2]
+    ch, cw = cam_frame.shape[:2]
+    target_h = max(1, int(h * scale))
+    target_w = max(1, int(cw * (target_h / ch)))
+    if target_w > w:
+        target_w = w
+        target_h = int(ch * (target_w / cw))
+    resized = cv2.resize(cam_frame, (target_w, target_h))
+    margin = 20
+    x1 = margin
+    y1 = max(0, h - target_h - margin)
+    base[y1:y1 + target_h, x1:x1 + target_w] = resized
+    return base
+
+
+def resolve_resource(path_str: str):
+    path = Path(path_str)
+    if path.exists():
+        return path
+    fallback = Path(r"C:\Users\User\Documents\GitHub\Smile-Detector-using-Python-main") / path_str
+    if fallback.exists():
+        return fallback
+    return path
 
 
 def main():
-    global CONFIG
-    CONFIG = load_config(Path("config.json"))
-    patch_mediapipe_bindings()
-    model_path = Path(CONFIG["face_landmarker_model"])
-    if not model_path.exists():
+    cfg = load_config(Path("config.json"))
+    model_path = resolve_resource(cfg["smile_cnn_model"])
+    cascade_path = resolve_resource(cfg["smile_cascade_path"])
+    if not model_path.exists() or not cascade_path.exists():
         raise RuntimeError(
-            f"Face landmarker model not found at {model_path}. "
-            "Download face_landmarker.task from MediaPipe and update config."
+            f"Missing model or cascade. model={model_path} cascade={cascade_path}"
         )
-    options = mp_face_landmarker.FaceLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(model_path)),
-        running_mode=VisionTaskRunningMode.IMAGE,
-        min_face_detection_confidence=CONFIG["face_detection_confidence"],
-        min_face_presence_confidence=CONFIG["face_tracking_confidence"],
-        min_tracking_confidence=CONFIG["face_tracking_confidence"],
-        num_faces=1,
-        output_face_blendshapes=False,
-        output_facial_transformation_matrixes=True,
-    )
-    face_mesh = mp_face_landmarker.FaceLandmarker.create_from_options(options)
 
-    cam_source = CONFIG["camera_url"] if CONFIG.get("camera_url") else CONFIG["camera_index"]
-    cam = cv2.VideoCapture(cam_source)
-    if not cam.isOpened():
+    detector = cv2.CascadeClassifier(str(cascade_path))
+    model = load_model(str(model_path))
+
+    cam_source = cfg["camera_url"] if cfg["camera_url"] else cfg["camera_index"]
+    camera = cv2.VideoCapture(cam_source)
+    if not camera.isOpened():
         raise RuntimeError("Cannot open camera")
-    print(f"Camera source: {cam_source}")
-    print(f"Camera opened: {cam.isOpened()}")
-    setup_camera_props(cam)
+    setup_camera_props(camera, cfg)
 
-    idle_path = find_idle_video()
-    idle = VideoLooper(idle_path)
-    smile_started_at = None
-    playing_trigger = False
-    current_trigger_path = None
-    trigger_frames = iter(())
+    window_name = "Smile CNN Test"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     screen_w, screen_h = get_screen_size()
-    idle_delay_until = None
-    trigger_cooldown_until = 0.0
-    pending_trigger = None
-    target_sync_frame = None
-    pending_requires_loop = False
-    last_idle_idx = 0
-    face_area_smooth = 0.0
+    idle = VideoLooper(find_idle_video())
+    active_videos = list_active_videos()
+    active_frames = iter(())
+    active_playing = False
+    smile_started_at = None
+    idle_start_at = time.monotonic()
+    pending_active = False
+    pending_target_frame = None
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty(
-        WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
-    )
+    frame_idx = 0
+    last_smiling = False
+    last_box = None
+    latest_frame = None
+    latest_idx = -1
+    processed_idx = -1
+    lock = threading.Lock()
+    stop_event = threading.Event()
 
-    hide_cursor()
-    try:
-        BASELINE_DURATION = 2.0  # seconds to average mouth percent sum after face appears
-        MOUTH_SUM_SMOOTH_ALPHA = 0.2
-        BASELINE_RECALC_FACTOR = CONFIG["baseline_recalc_factor"]  # trigger recalibration if current sum exceeds baseline by this factor
-        MOUTH_DROP_FACTOR = CONFIG["smile_drop_factor"]  # trigger smile when sum is below this fraction of baseline
-        MOUTH_DROP_HOLD_SECONDS = 1.0
-        FACE_LOSS_GRACE = 0.3  # seconds to tolerate face loss before resetting baseline
-        BASELINE_RECALC_HOLD = 0.3  # seconds threshold exceed must persist to trigger recalibration
-        baseline_start_at = None
-        baseline_acc_sum = 0.0
-        baseline_acc_count = 0
-        baseline_sum_final = None
-        mouth_pct_sum_smooth = None
-        mouth_drop_started_at = None
-        smile_indicator = False
-        smile_progress_ms = None
-        baseline_reset_until = None
-        baseline_reset_text = None
-        baseline_reset_started_at = None
-        face_absent_since = None
-        baseline_photo_frame = None
-        baseline_locked = False
-        photos_dir = Path("photos")
-        while True:
-            ret, cam_frame = cam.read()
-            if not ret:
+    def cnn_worker():
+        nonlocal last_smiling, last_box, processed_idx
+        while not stop_event.is_set():
+            with lock:
+                frame = None if latest_frame is None else latest_frame.copy()
+                idx = latest_idx
+            if frame is None or idx == processed_idx:
+                time.sleep(0.005)
                 continue
-            mouth_pct_left = None
-            mouth_pct_right = None
-            smile_indicator = False
-            smile_progress_ms = None
-
-            # Detect smile duration
-            (
-                face_present,
-                _smile_score_raw,
-                face_area_ratio_raw,
-                face_boxes,
-                smile_boxes,
-                mouth_metrics,
-                yaw_rad,
-                eye_bounds,
-            ) = detect_smile(cam_frame, face_mesh)
-            now = time.monotonic()
-            if not face_present:
-                if face_absent_since is None:
-                    face_absent_since = now
-                elif now - face_absent_since >= FACE_LOSS_GRACE:
-                    baseline_sum_final = None
-                    baseline_start_at = None
-                    baseline_acc_sum = 0.0
-                    baseline_acc_count = 0
-                    mouth_pct_sum_smooth = None
-                    mouth_drop_started_at = None
-                    smile_indicator = False
-                    smile_progress_ms = None
-                    baseline_reset_started_at = None
-                    baseline_photo_frame = None
-            alpha = CONFIG["smile_smooth_alpha"]
-            face_area_smooth = (1 - alpha) * face_area_smooth + alpha * face_area_ratio_raw
-            face_ok = face_area_smooth >= CONFIG["min_face_area_ratio"]
-            # Prepare base black canvas matching screen
-            canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-            cam_debug = cam_frame.copy()
-            # draw face and smile boxes on camera view
-            for (fx, fy, fw, fh) in face_boxes:
-                cv2.rectangle(cam_debug, (fx, fy), (fx + fw, fy + fh), (255, 0, 0), 2)
-            for (sx, sy, sw, sh) in smile_boxes:
-                cv2.rectangle(cam_debug, (sx, sy), (sx + sw, sy + sh), (0, 0, 255), 2)
-            # draw mouth landmarks from metrics
-            if mouth_metrics:
-                for key in ["left", "right", "center", "bottom"]:
-                    px, py = mouth_metrics[key]
-                    color = (0, 255, 255) if key != "bottom" else (0, 165, 255)
-                    cv2.circle(cam_debug, (int(px), int(py)), 4, color, -1)
-                # draw distance from each mouth corner to eye horizontal span with percent
-                if eye_bounds.get("left_min") is not None and eye_bounds.get("right_max") is not None:
-                    left_edge = eye_bounds["left_min"]
-                    right_edge = eye_bounds["right_max"]
-                    yaw_cos = 1.0
-                    if yaw_rad is not None:
-                        yaw_cos = max(0.2, abs(math.cos(yaw_rad)))
-                    width = max(1.0, right_edge - left_edge)
-                    width_corrected = width / yaw_cos
-                    sides = [
-                        ("left", (0, 255, 0), left_edge),
-                        ("right", (255, 0, 255), right_edge),
-                    ]
-                    for key, color, edge_x in sides:
-                        px, py = mouth_metrics[key]
-                        edge_pt = (edge_x, py)
-                        if key == "left":
-                            dist_px_signed = px - edge_x  # mouth moves right -> positive
-                        else:
-                            dist_px_signed = edge_x - px  # mouth moves left -> positive
-                        dist_corrected = dist_px_signed / yaw_cos
-                        percent = max(-100.0, min(100.0, (dist_corrected / max(width_corrected, 1.0)) * 100.0))
-                        if key == "left":
-                            mouth_pct_left = percent
-                        elif key == "right":
-                            mouth_pct_right = percent
-                        cv2.line(cam_debug, (px, py), edge_pt, color, 2, cv2.LINE_AA)
-                        label = f"{percent:.0f}%"
-                        text_x = int((px + edge_pt[0]) / 2)
-                        text_y = int((py + edge_pt[1]) / 2) - 8
-                        cv2.putText(
-                            cam_debug,
-                            label,
-                            (text_x, text_y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            color,
-                            2,
-                            cv2.LINE_AA,
-                        )
-                # vertical lines through eye and mouth corners for alignment visualization
-                left_eye_corner = eye_bounds.get("left_corner")
-                right_eye_corner = eye_bounds.get("right_corner")
-                if left_eye_corner and mouth_metrics.get("left"):
-                    lx, ly = left_eye_corner
-                    mx, my = mouth_metrics["left"]
-                    x_line = lx
-                    y1, y2 = sorted([ly, my])
-                    cv2.line(cam_debug, (x_line, y1), (x_line, y2), (0, 180, 0), 2, cv2.LINE_AA)
-                if right_eye_corner and mouth_metrics.get("right"):
-                    rx, ry = right_eye_corner
-                    mx, my = mouth_metrics["right"]
-                    x_line = rx
-                    y1, y2 = sorted([ry, my])
-                    cv2.line(cam_debug, (x_line, y1), (x_line, y2), (180, 0, 180), 2, cv2.LINE_AA)
-            canvas = place_camera_view(canvas, cam_debug)
-
-            # Pick frame to overlay
-            overlay = None
-            if playing_trigger:
-                overlay = next(trigger_frames, None)
-                if overlay is None:
-                    playing_trigger = False
-                    current_trigger_path = None
-                    idle_delay_until = time.monotonic() + CONFIG["idle_delay_seconds"]
-                    trigger_cooldown_until = time.monotonic() + CONFIG["trigger_cooldown_seconds"]
-                    pending_trigger = None
-                    target_sync_frame = None
-                    pending_requires_loop = False
-            if overlay is None:
-                if idle_delay_until and time.monotonic() < idle_delay_until:
-                    overlay = None  # stay black during delay
-                else:
-                    idle_delay_until = None
-                overlay, last_idle_idx, looped = idle.frame()
-                if pending_trigger and target_sync_frame is not None:
-                    if looped and last_idle_idx <= target_sync_frame:
-                        pending_requires_loop = False  # loop satisfied
-                    if (
-                        last_idle_idx >= target_sync_frame
-                        and (not pending_requires_loop or looped)
-                    ):
-                        overlay = next(trigger_frames, None)
-                        if overlay is not None:
-                            playing_trigger = True
-                            current_trigger_path = pending_trigger
-                            pending_trigger = None
-                            target_sync_frame = None
-                            pending_requires_loop = False
-                        else:
-                            pending_trigger = None
-                            target_sync_frame = None
-                            pending_requires_loop = False
-                if overlay is None and not playing_trigger:
-                    pending_trigger = None
-                    target_sync_frame = None
-                    pending_requires_loop = False
-
-            if overlay is not None:
-                canvas = overlay_frame(canvas, overlay)
-            # unlock baseline collection after trigger playback finishes
-            if baseline_locked and not playing_trigger and pending_trigger is None:
-                baseline_locked = False
-                baseline_sum_final = None
-                baseline_start_at = None
-                baseline_acc_sum = 0.0
-                baseline_acc_count = 0
-                baseline_photo_frame = None
-                mouth_pct_sum_smooth = None
-
-            # Debug overlay text
-            debug_lines = []
-            debug_lines.append(f"source: {cam_source}")
-            debug_lines.append(f"idle_frame: {last_idle_idx}")
-            debug_lines.append(f"next_sync: {next_sync_frame(last_idle_idx)}")
-            # mode = "trigger" if playing_trigger else "idle"
-            # if pending_trigger and not playing_trigger:
-            #     mode = f"pending->{target_sync_frame}"
-            # debug_lines.append(f"mode: {mode}")
-            # current_video = "idle"
-            # if playing_trigger and current_trigger_path:
-            #     current_video = current_trigger_path.name
-            # elif pending_trigger:
-            #     current_video = f"pending {pending_trigger.name}"
-            # debug_lines.append(f"video: {current_video}")
-            # debug_lines.append(f"idle_frame: {last_idle_idx}")
-            # debug_lines.append(f"sync_frames: {CONFIG['trigger_sync_frames']}")
-            # if target_sync_frame is not None:
-            #     debug_lines.append(
-            #         f"target_frame: {target_sync_frame} (wait_loop={pending_requires_loop})"
-            #     )
-            # debug_lines.append(f"face_present: {face_present}")
-            # debug_lines.append(f"faces: {len(face_boxes)} smiles: {len(smile_boxes)}")
-            # debug_lines.append(f"face_area_raw: {face_area_ratio_raw:.3f}")
-            # debug_lines.append(f"face_area: {face_area_smooth:.3f}")
-            # debug_lines.append(f"area_scale: {scale_area:.2f}")
-            # debug_lines.append(f"smile_raw: {smile_score_raw:.2f}")
-            # debug_lines.append(f"smile_avg: {window_avg:.2f}")
-            # debug_lines.append(f"smile_score: {smile_score:.2f}")
-            # if mouth_metrics:
-            #     debug_lines.append(
-            #         f"mouth_deltas: L {mouth_metrics['delta_left_norm']:.2f} R {mouth_metrics['delta_right_norm']:.2f}"
-            #     )
-            #     debug_lines.append(
-            #         f"mouth_delta_px: L {mouth_metrics['delta_left']:.1f} R {mouth_metrics['delta_right']:.1f}"
-            #     )
-            # if smile_started_at:
-            #     debug_lines.append(f"smile_hold: {now - smile_started_at:.2f}s")
-            # debug_lines.append(f"cooldown_ready: {now >= trigger_cooldown_until}")
-            # if idle_delay_until:
-            #     debug_lines.append(f"idle_delay_left: {max(0.0, idle_delay_until - now):.2f}s")
-            if mouth_pct_left is not None and mouth_pct_right is not None:
-                mouth_pct_sum_raw = mouth_pct_left + mouth_pct_right
-                face_absent_since = None
-                if not baseline_locked:
-                    if mouth_pct_sum_smooth is None:
-                        mouth_pct_sum_smooth = mouth_pct_sum_raw
-                    else:
-                        mouth_pct_sum_smooth = (
-                            (1 - MOUTH_SUM_SMOOTH_ALPHA) * mouth_pct_sum_smooth
-                            + MOUTH_SUM_SMOOTH_ALPHA * mouth_pct_sum_raw
-                        )
-                    debug_lines.append(f"mouth_pct_sum: {mouth_pct_sum_smooth:.0f}%")
-                    if (
-                        baseline_sum_final is not None
-                        and mouth_pct_sum_raw > baseline_sum_final * BASELINE_RECALC_FACTOR
-                    ):
-                        baseline_reset_text = (
-                            f"baseline_reset: raw {mouth_pct_sum_raw:.0f}% > baseline {baseline_sum_final:.0f}% * {BASELINE_RECALC_FACTOR}"
-                        )
-                        baseline_reset_started_at = baseline_reset_started_at or now
-                        if now - baseline_reset_started_at >= BASELINE_RECALC_HOLD:
-                            baseline_reset_until = now + 2.0
-                            baseline_sum_final = None
-                            baseline_start_at = now
-                            baseline_acc_sum = mouth_pct_sum_raw
-                            baseline_acc_count = 1
-                            baseline_reset_started_at = None
-                            baseline_photo_frame = None
-                    else:
-                        baseline_reset_started_at = None
-                    # baseline accumulation for first seconds after face appears
-                    if baseline_sum_final is None:
-                        if baseline_start_at is None:
-                            baseline_start_at = now
-                        elapsed = now - baseline_start_at
-                        baseline_acc_sum += mouth_pct_sum_raw
-                        baseline_acc_count += 1
-                        if elapsed >= BASELINE_DURATION and baseline_acc_count > 0:
-                            baseline_sum_final = baseline_acc_sum / baseline_acc_count
-                            baseline_photo_frame = cam_frame.copy()
-                    if baseline_sum_final is not None:
-                        debug_lines.append(f"baseline_sum: {baseline_sum_final:.0f}%")
-                        # drop_factor intentionally hidden
-                # smile indicator based on drop below baseline
-                smile_trigger = False
-                smile_indicator = False
-                if baseline_sum_final is not None:
-                    threshold = baseline_sum_final * MOUTH_DROP_FACTOR
-                    if mouth_pct_sum_raw <= threshold:
-                        if mouth_drop_started_at is None:
-                            mouth_drop_started_at = now
-                        elapsed = now - mouth_drop_started_at
-                        smile_progress_ms = int(elapsed * 1000)
-                        if elapsed >= MOUTH_DROP_HOLD_SECONDS:
-                            smile_trigger = True
-                            smile_indicator = True
-                    else:
-                        mouth_drop_started_at = None
-                        smile_progress_ms = None
-                else:
-                    mouth_drop_started_at = None
-                    smile_progress_ms = None
-
-                if (
-                    smile_trigger
-                    and not playing_trigger
-                    and now >= trigger_cooldown_until
-                    and pending_trigger is None
-                ):
-                    ts_send = time.strftime("%Y%m%d_%H%M%S")
-                    smile_photo_path = capture_photo(cam_frame, "smile", photos_dir, ts=ts_send)
-                    serious_photo_path = None
-                    if baseline_photo_frame is not None:
-                        serious_photo_path = capture_photo(baseline_photo_frame, "serious", photos_dir, ts=ts_send)
-                    baseline_locked = True
-                    baseline_sum_final = None
-                    baseline_start_at = None
-                    baseline_acc_sum = 0.0
-                    baseline_acc_count = 0
-                    baseline_photo_frame = None
-                    available = list_trigger_videos()
-                    if available:
-                        chosen = random.choice(available)
-                        pending_trigger = chosen
-                        target_sync_frame = next_sync_frame(last_idle_idx)
-                        pending_requires_loop = target_sync_frame < last_idle_idx
-                        trigger_frames = play_video_once(chosen)
-                        playing_trigger = False
-                    mouth_drop_started_at = None
-            else:
-                mouth_pct_sum_smooth = None
-                mouth_drop_started_at = None
-                smile_indicator = False
-                smile_progress_ms = None
-                if face_present:
-                    face_absent_since = None
-                baseline_reset_started_at = None
-            # show baseline reset reason for a short time
-            if baseline_reset_until is not None and now < baseline_reset_until and baseline_reset_text:
-                debug_lines.append(baseline_reset_text)
-            elif baseline_reset_until is not None and now >= baseline_reset_until:
-                baseline_reset_until = None
-                baseline_reset_text = None
-                baseline_reset_started_at = None
-
-            indicator_color = (0, 255, 0) if smile_indicator else (0, 0, 255)
-            cv2.putText(canvas, "SMILE READY", (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, indicator_color, 2, cv2.LINE_AA)
-            progress_color = (0, 200, 255) if smile_progress_ms is not None else (80, 80, 80)
-            progress_text = "SMILE PROGRESS"
-            if smile_progress_ms is not None:
-                progress_text += f": {smile_progress_ms} ms"
-            cv2.putText(canvas, progress_text, (20, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.7, progress_color, 2, cv2.LINE_AA)
-            # mouth visibility/presence debug removed (not reliable for face landmarks)
-
-            y = 100
-            for line in debug_lines:
-                cv2.putText(canvas, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
-                y += 24
-
-            cv2.imshow(WINDOW_NAME, canvas)
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC to exit
+            if idx % max(cfg["cnn_every_n"], 1) != 0:
+                processed_idx = idx
+                continue
+            scale = cfg["cnn_detect_scale"]
+            if scale <= 0 or scale > 1:
+                scale = 1.0
+            small = frame if scale == 1.0 else cv2.resize(
+                frame, (int(frame.shape[1] * scale), int(frame.shape[0] * scale))
+            )
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            rects = detector.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30), flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            smiling = False
+            box = None
+            for (fX, fY, fW, fH) in rects:
+                roi = gray[fY:fY + fH, fX:fX + fW]
+                if roi.size == 0:
+                    continue
+                roi = cv2.resize(roi, (28, 28))
+                roi = roi.astype("float") / 255.0
+                roi = img_to_array(roi)
+                roi = np.expand_dims(roi, axis=0)
+                (not_smiling, smiling_prob) = model.predict(roi, verbose=0)[0]
+                smiling = smiling_prob > not_smiling
+                if scale != 1.0:
+                    fX = int(fX / scale)
+                    fY = int(fY / scale)
+                    fW = int(fW / scale)
+                    fH = int(fH / scale)
+                box = (fX, fY, fW, fH, smiling)
                 break
-    finally:
-        show_cursor()
-        idle.release()
-        cam.release()
-        face_mesh.close()
-        cv2.destroyAllWindows()
+            with lock:
+                last_smiling = smiling
+                last_box = box
+                processed_idx = idx
+
+    worker = threading.Thread(target=cnn_worker, daemon=True)
+    worker.start()
+    while True:
+        grabbed, frame = camera.read()
+        if not grabbed:
+            continue
+
+        frame_clone = frame.copy()
+        with lock:
+            latest_frame = frame
+            latest_idx = frame_idx
+            smiling = last_smiling
+            box = last_box
+        if box is not None:
+            fX, fY, fW, fH, is_smiling = box
+            color = (0, 255, 0) if is_smiling else (0, 0, 255)
+            label = "Smiling" if is_smiling else "Not Smiling"
+            cv2.putText(frame_clone, label, (fX, fY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+            cv2.rectangle(frame_clone, (fX, fY), (fX + fW, fH + fY), color, 2)
+
+        indicator_color = (0, 255, 0) if smiling else (0, 0, 255)
+        if cfg["camera_display_scale"] < 1.0:
+            ds = max(0.1, min(1.0, cfg["camera_display_scale"]))
+            frame_clone = cv2.resize(
+                frame_clone, (int(frame_clone.shape[1] * ds), int(frame_clone.shape[0] * ds))
+            )
+        canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+        canvas = place_camera_bottom_left(canvas, frame_clone, cfg["camera_view_scale"])
+        if active_playing:
+            active_frame = next(active_frames, None)
+            if active_frame is None:
+                active_playing = False
+                idle_start_at = time.monotonic()
+            else:
+                canvas = overlay_top_right(canvas, active_frame, cfg["video_size"])
+        if not active_playing:
+            idle_frame, _, _ = idle.frame()
+            if idle_frame is not None:
+                canvas = overlay_top_right(canvas, idle_frame, cfg["video_size"])
+        cv2.rectangle(canvas, (20, 20), (80, 80), indicator_color, -1)
+        cv2.imshow(window_name, canvas)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+        frame_idx += 1
+        now = time.monotonic()
+        if not active_playing and active_videos and (now - idle_start_at) >= cfg["idle_smile_delay"]:
+            if smiling:
+                if smile_started_at is None:
+                    smile_started_at = now
+                elif now - smile_started_at >= cfg["smile_hold_seconds"]:
+                    pending_active = True
+                    smile_started_at = None
+            else:
+                smile_started_at = None
+        else:
+            smile_started_at = None
+
+        if pending_active and not active_playing:
+            target = next_sync_frame(idle.frame_idx, cfg["trigger_sync_frames"])
+            if idle.frame_idx >= target:
+                chosen = np.random.choice(active_videos)
+                active_frames = play_video_once(chosen)
+                active_playing = True
+                pending_active = False
+
+    camera.release()
+    idle.release()
+    cv2.destroyAllWindows()
+    stop_event.set()
+    worker.join(timeout=1.0)
 
 
 if __name__ == "__main__":
