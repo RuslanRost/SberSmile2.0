@@ -24,6 +24,7 @@ VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 DEFAULT_CONFIG = {
     "video_size": [336, 672],
     "camera_index": 0,
+    "camera_url": "",
     "idle_delay_seconds": 5.0,
     "trigger_cooldown_seconds": 5.0,
     "smile_smooth_alpha": 0.1,
@@ -59,6 +60,7 @@ def load_config(path: Path):
     cfg["video_size"] = tuple(int(x) for x in cfg["video_size"])
     cfg["trigger_sync_frames"] = [int(x) for x in cfg["trigger_sync_frames"]]
     cfg["camera_index"] = int(cfg["camera_index"])
+    cfg["camera_url"] = str(cfg.get("camera_url", "") or "")
     cfg["idle_delay_seconds"] = float(cfg["idle_delay_seconds"])
     cfg["trigger_cooldown_seconds"] = float(cfg["trigger_cooldown_seconds"])
     cfg["smile_smooth_alpha"] = float(cfg["smile_smooth_alpha"])
@@ -394,7 +396,8 @@ def main():
     )
     face_mesh = mp_face_landmarker.FaceLandmarker.create_from_options(options)
 
-    cam = cv2.VideoCapture(CONFIG["camera_index"])
+    cam_source = CONFIG["camera_url"] if CONFIG.get("camera_url") else CONFIG["camera_index"]
+    cam = cv2.VideoCapture(cam_source)
     if not cam.isOpened():
         raise RuntimeError("Cannot open camera")
     setup_camera_props(cam)
@@ -607,6 +610,8 @@ def main():
 
             # Debug overlay text
             debug_lines = []
+            debug_lines.append(f"idle_frame: {last_idle_idx}")
+            debug_lines.append(f"next_sync: {next_sync_frame(last_idle_idx)}")
             # mode = "trigger" if playing_trigger else "idle"
             # if pending_trigger and not playing_trigger:
             #     mode = f"pending->{target_sync_frame}"
@@ -685,6 +690,7 @@ def main():
                             baseline_photo_frame = cam_frame.copy()
                     if baseline_sum_final is not None:
                         debug_lines.append(f"baseline_sum: {baseline_sum_final:.0f}%")
+                        # drop_factor intentionally hidden
                 # smile indicator based on drop below baseline
                 smile_trigger = False
                 smile_indicator = False
@@ -754,6 +760,7 @@ def main():
             if smile_progress_ms is not None:
                 progress_text += f": {smile_progress_ms} ms"
             cv2.putText(canvas, progress_text, (20, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.7, progress_color, 2, cv2.LINE_AA)
+            # mouth visibility/presence debug removed (not reliable for face landmarks)
 
             y = 100
             for line in debug_lines:
