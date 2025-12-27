@@ -59,12 +59,20 @@ if errorlevel 1 (
 git pull origin main
 
 :run
-if exist ".venv312\Scripts\python.exe" (
-  ".venv312\Scripts\python.exe" main.py
-) else (
-  echo Venv not found. Running system Python.
-  python main.py
+if not exist ".venv312\Scripts\python.exe" (
+  echo Venv not found. Please create .venv312.
+  pause
+  goto :eof
 )
+
+".venv312\Scripts\python.exe" -V >nul 2>nul
+if errorlevel 1 (
+  echo Venv Python is broken. Recreate .venv312.
+  pause
+  goto :eof
+)
+
+".venv312\Scripts\python.exe" main.py
 if errorlevel 1 (
   echo Script exited with error.
   pause
